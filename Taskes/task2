@@ -1,0 +1,8 @@
+email = input("Введите электронную почту: ")
+
+position = email.find("@")
+length = len(email)
+
+domain = email[position + 1:length]
+
+print("Домен:", domain)

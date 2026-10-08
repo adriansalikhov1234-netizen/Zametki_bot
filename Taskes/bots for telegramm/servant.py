@@ -22,7 +22,7 @@ import logging
 import os
 
 from dotenv import load_dotenv, set_key
-from telegram import BotCommand, Update
+from telegram import BotCommand, ReplyParameters, Update
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -36,12 +36,14 @@ from telegram.ext import (
 # Настройка
 # --------------------------------------------------------------------------
 
-ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+ENV_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
+)
 load_dotenv(ENV_PATH)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8413181150:AAGhDXIsc27OqwPxtCmaHVHnd5kSdsQL8iw")
-MY_USER_ID = int(os.getenv("MY_USER_ID", "5476112914"))
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002611376562"))
+BOT_TOKEN = os.getenv("SERVANT_BOT_TOKEN")
+MY_USER_ID = int(os.getenv("SERVANT_MY_USER_ID", "0"))
+TARGET_CHAT_ID = int(os.getenv("SERVANT_TARGET_CHAT_ID", "0"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -71,6 +73,30 @@ def _display_name(user) -> str:
     return f"{user.full_name} (id {user.id})"
 
 
+def _remember_group_message(
+    context: ContextTypes.DEFAULT_TYPE, private_message_id: int, group_message_id: int
+) -> None:
+    """Сохраняет связь пересланного личного сообщения с исходным сообщением группы."""
+    context.bot_data.setdefault("private_to_group_message_ids", {})[
+        private_message_id
+    ] = group_message_id
+
+
+def _reply_parameters_for_group_message(
+    message, context: ContextTypes.DEFAULT_TYPE
+) -> ReplyParameters | None:
+    if not message.reply_to_message:
+        return None
+
+    group_message_id = context.bot_data.get(
+        "private_to_group_message_ids", {}
+    ).get(message.reply_to_message.message_id)
+    if group_message_id is None:
+        return None
+
+    return ReplyParameters(message_id=group_message_id)
+
+
 # --------------------------------------------------------------------------
 # Команды
 # --------------------------------------------------------------------------
@@ -80,6 +106,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! Я бот-мост между тобой и группой.\n\n"
         "Напиши мне текст в личку — я перешлю его в целевую группу.\n"
         "Любое сообщение в группе (кроме моих собственных) я перешлю тебе.\n"
+        "Если ответишь в личке на пересланное сообщение, мой ответ попадёт в группу "
+        "как ответ на исходное сообщение.\n"
         "Команды /image и /sticker позволяют отправить в группу картинку или стикер.\n\n"
         "Команды: /help"
     )
@@ -98,7 +126,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — это сообщение\n\n"
         "Обычный текст в личке (без команды) автоматически пересылается в группу.\n"
         "Любое сообщение в целевой группе автоматически пересылается тебе в личку "
-        "с пометкой автора вида @username."
+        "с пометкой автора вида @username. Ответь в личке на такое сообщение, "
+        "чтобы отправить ответ в группу в исходной ветке."
     )
 
 
@@ -213,7 +242,7 @@ async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     TARGET_CHAT_ID = chat.id
     # сохраняем в .env, чтобы значение осталось после перезапуска бота
     try:
-        set_key(ENV_PATH, "TARGET_CHAT_ID", str(TARGET_CHAT_ID))
+        set_key(ENV_PATH, "SERVANT_TARGET_CHAT_ID", str(TARGET_CHAT_ID))
     except Exception:
         logger.exception("Не удалось записать TARGET_CHAT_ID в .env")
 
@@ -271,18 +300,26 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # --- обычная пересылка текста, фото и стикеров ---
+    reply_parameters = _reply_parameters_for_group_message(message, context)
+
     if message.text:
-        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=message.text)
+        await context.bot.send_message(
+            chat_id=TARGET_CHAT_ID,
+            text=message.text,
+            reply_parameters=reply_parameters,
+        )
     elif message.sticker:
         await context.bot.send_sticker(
             chat_id=TARGET_CHAT_ID,
             sticker=message.sticker.file_id,
+            reply_parameters=reply_parameters,
         )
     elif message.photo:
         await context.bot.copy_message(
             chat_id=TARGET_CHAT_ID,
             from_chat_id=message.chat_id,
             message_id=message.message_id,
+            reply_parameters=reply_parameters,
         )
 
 
@@ -315,29 +352,37 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if message.photo:
         caption = f"{attribution} : {message.caption}" if message.caption else attribution
-        await context.bot.send_photo(
+        sent_message = await context.bot.send_photo(
             chat_id=MY_USER_ID,
             photo=message.photo[-1].file_id,
             caption=caption,
         )
+        _remember_group_message(context, sent_message.message_id, message.message_id)
         return
 
     if message.sticker:
-        await context.bot.send_message(chat_id=MY_USER_ID, text=attribution)
-        await context.bot.send_sticker(
+        attribution_message = await context.bot.send_message(
+            chat_id=MY_USER_ID, text=attribution
+        )
+        sent_message = await context.bot.send_sticker(
             chat_id=MY_USER_ID,
             sticker=message.sticker.file_id,
         )
+        _remember_group_message(
+            context, attribution_message.message_id, message.message_id
+        )
+        _remember_group_message(context, sent_message.message_id, message.message_id)
         return
 
     text = message.text or message.caption
     if not text:
         return
 
-    await context.bot.send_message(
+    sent_message = await context.bot.send_message(
         chat_id=MY_USER_ID,
         text=f"{attribution} : {text}",
     )
+    _remember_group_message(context, sent_message.message_id, message.message_id)
 
 
 # --------------------------------------------------------------------------
@@ -361,9 +406,9 @@ async def post_init(application: Application) -> None:
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN не задан. Проверь файл .env")
+        raise SystemExit("SERVANT_BOT_TOKEN не задан. Проверь файл .env")
     if not MY_USER_ID:
-        raise SystemExit("MY_USER_ID не задан. Проверь файл .env")
+        raise SystemExit("SERVANT_MY_USER_ID не задан. Проверь файл .env")
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 

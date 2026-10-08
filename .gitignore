@@ -1,7 +1,8 @@
-.env
-__pycache__/
-*.pyc
-*.db
-*.sqlite
-*.sqlite3
-venv/
+# Игнорировать всё
+/*
+
+# Но не игнорировать zametka.py
+!/zametka.py
+
+# И не игнорировать .gitignore
+!/.gitignore

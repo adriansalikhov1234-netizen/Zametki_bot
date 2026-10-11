@@ -1,14 +1,16 @@
 import os
 import random
+import re
 import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
 
 
 # ============================================================
@@ -18,7 +20,22 @@ from openai import AsyncOpenAI
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+)
+GOOGLE_CLOUD_PROJECT = (
+    os.getenv("GOOGLE_CLOUD_PROJECT")
+    or os.getenv("GCLOUD_PROJECT")
+)
+GOOGLE_CLOUD_LOCATION = os.getenv(
+    "GOOGLE_CLOUD_LOCATION",
+    "us-central1"
+)
+USE_VERTEX_AI = os.getenv(
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    ""
+).lower() in {"1", "true", "yes"}
 
 # TARGET_CHAT_ID здесь не используется этим ботом.
 # Он может спокойно оставаться в твоём .env.
@@ -33,9 +50,9 @@ if not DISCORD_TOKEN:
         "Не найден DISCORD_TOKEN в файле .env"
     )
 
-if not OPENAI_API_KEY:
+if USE_VERTEX_AI and not GOOGLE_CLOUD_PROJECT:
     raise RuntimeError(
-        "Не найден OPENAI_API_KEY в файле .env"
+        "Для Vertex AI укажи GOOGLE_CLOUD_PROJECT в файле .env"
     )
 
 
@@ -43,20 +60,54 @@ if not OPENAI_API_KEY:
 # НАСТРОЙКИ
 # ============================================================
 
-MODEL = "gpt-4o-mini"
+MODEL = "gemini-3.8-flash"
 
 DEFAULT_REPLY_CHANCE = 0.08
 DEFAULT_MEMORY_LIMIT = 30
-AUTO_REPLY_COOLDOWN = 12
-
-
-# ============================================================
-# OPENAI
-# ============================================================
-
-ai = AsyncOpenAI(
-    api_key=OPENAI_API_KEY
+DISCORD_MESSAGE_LIMIT = 1900
+RUDE_WORD_PATTERN = re.compile(
+    r"(?<!\w)(?:"
+    r"бля\w*|"
+    r"ху[йеяию]\w*|хер\w*|"
+    r"нах[уёе]\w*|"
+    r"пизд\w*|"
+    r"еб[а-яё]*|ёб[а-яё]*|"
+    r"су[чк]\w*|мудак\w*|гандон\w*|"
+    r"долбо[её]б\w*|пидор\w*|чмо|сволоч\w*|"
+    r"урод\w*|говн\w*|засран\w*|"
+    r"идиот\w*|дебил\w*|кретин\w*|"
+    r"fuck\w*|shit\w*|bitch\w*|asshole\w*"
+    r")(?!\w)",
+    re.IGNORECASE
 )
+RUDE_REPLIES = (
+    "Давай без негатива 🙂",
+    "Давай жить дружно! 🤝",
+    "Не ругайся, а то маме твоей пожалуюсь 😄"
+)
+
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+if USE_VERTEX_AI:
+    ai = genai.Client(
+        vertexai=True,
+        project=GOOGLE_CLOUD_PROJECT,
+        location=GOOGLE_CLOUD_LOCATION
+    )
+else:
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Не найден GEMINI_API_KEY или GOOGLE_API_KEY в файле .env. "
+            "Для входа через Google Cloud задай "
+            "GOOGLE_GENAI_USE_VERTEXAI=true и GOOGLE_CLOUD_PROJECT."
+        )
+
+    ai = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
 
 # ============================================================
@@ -250,7 +301,7 @@ def save_message(
             user_id,
             username,
             content,
-            datetime.utcnow().isoformat()
+            datetime.now(timezone.utc).isoformat()
         )
     )
 
@@ -346,6 +397,43 @@ def contains_banned_word(
     return False
 
 
+def contains_rude_language(text: str) -> bool:
+    return RUDE_WORD_PATTERN.search(text) is not None
+
+
+def split_discord_message(text: str) -> list[str]:
+    chunks = []
+
+    while text:
+        chunk_end = 0
+        last_whitespace = 0
+        length = 0
+
+        for index, character in enumerate(text):
+            character_length = 2 if ord(character) > 0xFFFF else 1
+
+            if length + character_length > DISCORD_MESSAGE_LIMIT:
+                break
+
+            length += character_length
+            chunk_end = index + 1
+
+            if character.isspace():
+                last_whitespace = chunk_end
+
+        if chunk_end == len(text):
+            chunks.append(text)
+            break
+
+        if last_whitespace:
+            chunk_end = last_whitespace
+
+        chunks.append(text[:chunk_end])
+        text = text[chunk_end:]
+
+    return chunks
+
+
 # ============================================================
 # DISCORD INTENTS
 # ============================================================
@@ -370,8 +458,6 @@ class SgLyPaBot(commands.Bot):
             intents=intents,
             help_command=None
         )
-
-        self.cooldowns = {}
 
 
     async def setup_hook(self):
@@ -465,33 +551,20 @@ async def generate_response(
 
     try:
 
-        response = await ai.chat.completions.create(
+        response = await ai.aio.interactions.create(
             model=MODEL,
-
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-
-                {
-                    "role": "user",
-                    "content": (
-                        f"Пользователь "
-                        f"{username} написал:\n\n"
-                        f"{current_message}\n\n"
-                        f"Ответь ему."
-                    )
-                }
-            ],
-
-            temperature=0.9,
-
-            max_tokens=300
+            input=(
+                f"Пользователь {username} написал:\n\n"
+                f"{current_message}\n\n"
+                "Ответь ему."
+            ),
+            system_instruction=system_prompt,
+            generation_config={
+                "temperature": 0.9
+            }
         )
 
-
-        result = response.choices[0].message.content
+        result = response.output_text
 
         if not result:
             return None
@@ -502,7 +575,7 @@ async def generate_response(
     except Exception as e:
 
         print(
-            "ОШИБКА OPENAI:",
+            "ОШИБКА GEMINI:",
             repr(e)
         )
 
@@ -563,11 +636,13 @@ async def on_message(
         return
 
 
-    # Проверяем бан-слова
+    rude_message = contains_rude_language(content)
 
-    if contains_banned_word(
-        guild_id,
-        content
+    # Пользовательские бан-слова продолжают скрывать сообщения,
+    # но грубость получает дружелюбный ответ.
+    if (
+        not rude_message
+        and contains_banned_word(guild_id, content)
     ):
 
         await bot.process_commands(message)
@@ -575,104 +650,60 @@ async def on_message(
         return
 
 
-    # Проверяем упоминание бота
-
-    mentioned = (
-        bot.user in message.mentions
-    )
-
-
-    # Проверяем ответ на сообщение бота
-
     replied_to_bot = False
 
-
     if message.reference:
+        referenced_message = message.reference.resolved
 
-        try:
-
-            referenced_message = (
-                await message.channel.fetch_message(
-                    message.reference.message_id
+        if not isinstance(referenced_message, discord.Message):
+            try:
+                referenced_message = await asyncio.wait_for(
+                    message.channel.fetch_message(
+                        message.reference.message_id
+                    ),
+                    timeout=5
                 )
-            )
+            except (discord.HTTPException, asyncio.TimeoutError) as error:
+                print(
+                    "Не удалось проверить сообщение, на которое ответили:",
+                    repr(error)
+                )
+                referenced_message = None
 
-            if (
-                referenced_message.author.id
-                == bot.user.id
-            ):
-
-                replied_to_bot = True
-
-        except Exception:
-
-            pass
-
-
-    should_reply = False
-
-
-    # Если бота упомянули
-    if mentioned:
-
-        should_reply = True
-
-
-    # Если ответили боту
-    elif replied_to_bot:
-
-        should_reply = True
-
-
-    else:
-
-        chance = float(
-            settings["reply_chance"]
+        replied_to_bot = (
+            referenced_message is not None
+            and bot.user is not None
+            and referenced_message.author.id == bot.user.id
         )
 
+    mentioned_bot = (
+        bot.user is not None
+        and bot.user in message.mentions
+    )
 
-        now = (
-            asyncio.get_event_loop().time()
-        )
-
-
-        last_reply = (
-            bot.cooldowns.get(guild_id)
-        )
-
-
-        if (
-            last_reply is None
-            or now - last_reply >= AUTO_REPLY_COOLDOWN
-        ):
-
-            if random.random() < chance:
-
-                should_reply = True
-
-
-    if should_reply:
-
-        bot.cooldowns[guild_id] = (
-            asyncio.get_event_loop().time()
-        )
-
-
-        async with message.channel.typing():
-
-            response = await generate_response(
-                guild_id,
-                content,
-                message.author.display_name
-            )
+    if replied_to_bot or mentioned_bot:
+        if rude_message:
+            response = random.choice(RUDE_REPLIES)
+        else:
+            async with message.channel.typing():
+                response = await generate_response(
+                    guild_id,
+                    content,
+                    message.author.display_name
+                )
 
 
         if response:
-
-            await message.reply(
-                response,
-                mention_author=False
-            )
+            for index, chunk in enumerate(
+                split_discord_message(response)
+            ):
+                if index == 0:
+                    await message.reply(
+                        chunk,
+                        mention_author=False
+                    )
+                else:
+                    await message.channel.send(chunk)
 
             add_stat(
                 guild_id,

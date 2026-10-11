@@ -348,7 +348,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         and message.reply_to_message.from_user.id == bot_user.id
     )
     prefix = "↩️ " if is_reply_to_bot else ""
-    attribution = f"{prefix}{author}"
+    reply_target = (
+        f" ↪️ в ответ {_display_name(message.reply_to_message.from_user)}"
+        if message.reply_to_message and message.reply_to_message.from_user
+        else ""
+    )
+    attribution = f"{prefix}{author}{reply_target}"
 
     if message.photo:
         caption = f"{attribution} : {message.caption}" if message.caption else attribution
